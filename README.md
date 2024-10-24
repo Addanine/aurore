@@ -10,7 +10,7 @@ You can install Aurore using your preferred package manager:
 
 ```lua
 {
-    'addanine/aurore',
+    'addanine/aurore.nvim',
     config = function()
         require('aurore').setup()
     end
@@ -21,7 +21,7 @@ You can install Aurore using your preferred package manager:
 
 ```lua
 use {
-    'addanine/aurore',
+    'addanine/aurore.nvim',
     config = function()
         require('aurore').setup()
     end
