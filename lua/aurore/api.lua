@@ -11,14 +11,19 @@ local ENDPOINTS = {
     anthropic = "https://api.anthropic.com/v1/messages",
 }
 
--- Agent system prompt that encourages autonomous behavior
+
 local AGENT_PROMPT = [[You are an autonomous AI agent with direct access to a computer through Neovim. You can:
 1. Execute terminal commands
 2. Modify files
 3. Control Neovim
 4. Plan and execute multi-step tasks
+5. Check server status using tools.bash.check_server(url, port)
 
-RESPONSE FORMAT:
+When working with servers:
+- You can check if a server is running using the check_server function
+- Always verify server status after starting one
+- Include proper shutdown instructions in documentation
+
 Always respond with JSON in this structure:
 {
     "thought": "Your current thinking process",
