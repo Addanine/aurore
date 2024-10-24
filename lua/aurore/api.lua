@@ -1,27 +1,33 @@
 -- api.lua
 local curl = require('plenary.curl')
-local config = require('aurore.config')
 local ui = require('aurore.ui.status')
 local recovery = require('aurore.recovery')
 local debug = require('aurore.debug')
 local docs = require('aurore.docs')
 
+-- Create module
+local M = {}
+
+-- Store config at module level
+M.config = nil
+
 -- State management
 local task_history = {}
 local current_task = nil
 
--- Retry configuration
+-- Retry configuration (unchanged)
 local RETRY_CONFIG = {
     max_attempts = 3,
-    initial_delay = 1000, -- 1 second
-    max_delay = 5000 -- 5 seconds
+    initial_delay = 1000,
+    max_delay = 5000
 }
 
--- API endpoints
+-- API endpoints (unchanged)
 local ENDPOINTS = {
     openai = "https://api.openai.com/v1/chat/completions",
     anthropic = "https://api.anthropic.com/v1/messages",
 }
+
 
 -- Agent system prompt
 local AGENT_PROMPT = [[You are an autonomous AI agent with direct access to a computer through Neovim. You can:
@@ -84,13 +90,15 @@ IMPORTANT GUIDELINES:
 5. When a file is complete, move on to the next task
 6. Consider a task complete when all specified requirements are met]]
 
--- Task state management
+
+
 local task_state = {
     files_created = {},
     operations_performed = {},
     current_iteration = 0,
     max_iterations = 5
 }
+
 
 -- Helper function for retry logic
 local function retry_with_backoff(fn)
@@ -358,12 +366,17 @@ end
 local function run_agent(initial_prompt)
     debug.log('task_start', 'Starting new task: ' .. initial_prompt)
     
+    -- Check if config is initialized
+    if not M.config then
+        error("Aurore not properly initialized. Please call setup() first.")
+    end
+    
     -- Reset task state
     task_state = {
         files_created = {},
         operations_performed = {},
         current_iteration = 0,
-        max_iterations = config.options.task.max_iterations or 5
+        max_iterations = M.config.task.max_iterations or 5
     }
     
     -- Initialize current task
@@ -385,7 +398,11 @@ local function run_agent(initial_prompt)
     
     -- Get initial plan
     local response = send_ai_request(initial_prompt, context)
-    if not response then return end
+    if not response then 
+        debug.log('error', 'Failed to get initial response from AI')
+        ui.update({ status = "Error", error = "Failed to get AI response" })
+        return 
+    end
     
     -- Show initial plan
     ui.update({
@@ -432,32 +449,43 @@ local function run_agent(initial_prompt)
         
         if not success then
             debug.log('error', 'Error in step execution: ' .. error)
-            if config.options.features.auto_recovery then
+            if M.config.features.auto_recovery then
                 debug.log('recovery', 'Attempting to restore checkpoint')
                 recovery.restore_checkpoint(checkpoint)
             end
+            ui.update({ status = "Error", error = "Step execution failed" })
             break
         end
         
         -- Get next step
         response = continue_execution(step_results, context, initial_prompt)
-        if not response then break end
+        if not response then 
+            debug.log('error', 'Failed to get next step from AI')
+            ui.update({ status = "Error", error = "Failed to get next AI response" })
+            break 
+        end
         
         -- Create new checkpoint
         checkpoint = recovery.save_checkpoint()
         
         -- Optional delay to prevent overwhelming the system
-        vim.cmd('sleep 100m')
+        if M.config.performance and M.config.performance.delay_between_steps then
+            vim.cmd('sleep ' .. M.config.performance.delay_between_steps .. 'm')
+        else
+            vim.cmd('sleep 100m')
+        end
     end
     
     -- Task completion
     if response and response.task_complete then
         debug.log('task_complete', 'Task completed successfully')
         
-        -- Generate documentation
-        if config.options.features.auto_documentation then
+        -- Generate documentation if enabled
+        if M.config.features.auto_documentation then
             local documentation = docs.generate_task_doc(current_task)
-            vim.fn.writefile(vim.split(documentation, '\n'), 'AURORE_TASKS.md', 'a')
+            local doc_path = M.config.docs.output_dir .. '/AURORE_TASKS.md'
+            vim.fn.mkdir(vim.fn.fnamemodify(doc_path, ':h'), 'p')
+            vim.fn.writefile(vim.split(documentation, '\n'), doc_path, 'a')
         end
         
         -- Update task history
@@ -465,22 +493,64 @@ local function run_agent(initial_prompt)
         current_task.success = true
         table.insert(task_history, current_task)
         
-        ui.update({ status = "Task completed!" })
+        -- Handle successful completion
+        ui.update({ 
+            status = "Task completed!",
+            task = {
+                description = initial_prompt,
+                completion_time = os.time() - current_task.start_time,
+                success = true
+            }
+        })
+        
+        -- Trigger completion hooks if configured
+        if M.config.hooks and M.config.hooks.after_task then
+            pcall(M.config.hooks.after_task, current_task)
+        end
     else
         debug.log('task_incomplete', 'Task did not complete successfully')
+        
+        -- Update task history
         current_task.end_time = os.time()
         current_task.success = false
         table.insert(task_history, current_task)
+        
+        -- Handle failure
+        ui.update({ 
+            status = "Task failed", 
+            error = "Maximum iterations reached or execution failed",
+            task = {
+                description = initial_prompt,
+                completion_time = os.time() - current_task.start_time,
+                success = false
+            }
+        })
+        
+        -- Trigger error hooks if configured
+        if M.config.hooks and M.config.hooks.on_error then
+            pcall(M.config.hooks.on_error, {
+                task = current_task,
+                error = "Task did not complete successfully",
+                iterations = task_state.current_iteration
+            })
+        end
+    end
+    
+    -- Clean up
+    if state.win then
+        vim.defer_fn(function()
+            ui.close()
+        end, 3000) -- Close UI after 3 seconds
     end
 end
-
 -- Module exports
 local M = {}
 
 M.setup = function(opts)
-    config = opts
+    M.config = opts
     debug.log('setup', 'API module initialized with config: ' .. vim.inspect(opts))
 end
+
 
 M.execute_task = function(prompt)
     run_agent(prompt)

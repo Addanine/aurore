@@ -1,3 +1,4 @@
+-- init.lua
 local M = {}
 
 -- Helper function to safely require a module
@@ -11,16 +12,19 @@ local function safe_require(module)
 end
 
 M.setup = function(opts)
-    -- Load config first
+    -- Load and setup config first
     local config = safe_require('aurore.config')
     if not config then
-        return  -- Exit if config can't be loaded
+        return
     end
-
+    
     -- Setup config with options
     config.setup(opts)
-
-    -- Components to initialize
+    
+    -- Store the configured options
+    local options = config.options
+    
+    -- Components to initialize in order
     local components = {
         { name = 'debug', required = false },
         { name = 'api', required = true },
@@ -32,17 +36,17 @@ M.setup = function(opts)
         { name = 'git', required = false },
         { name = 'lsp', required = false }
     }
-
-    -- Initialize each component
+    
+    -- Initialize each component with the config options
     for _, component in ipairs(components) do
         local module = safe_require('aurore.' .. component.name)
         if module then
             if type(module.setup) == 'function' then
-                local ok, err = pcall(module.setup, config.options)
+                local ok, err = pcall(module.setup, options)
                 if not ok then
                     vim.notify(string.format("Failed to setup '%s': %s", component.name, err), vim.log.levels.ERROR)
                     if component.required then
-                        return  -- Exit if required component fails
+                        return
                     end
                 end
             end
