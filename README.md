@@ -10,7 +10,7 @@ You can install Aurore using your preferred package manager:
 
 ```lua
 {
-    'harryoltmans/aurore',
+    'addanine/aurore',
     config = function()
         require('aurore').setup()
     end
@@ -21,7 +21,7 @@ You can install Aurore using your preferred package manager:
 
 ```lua
 use {
-    'harryoltmans/aurore',
+    'addanine/aurore',
     config = function()
         require('aurore').setup()
     end
