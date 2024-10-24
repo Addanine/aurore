@@ -47,11 +47,19 @@ Always respond with JSON in this structure:
 
 AVAILABLE VIM COMMANDS:
 1. create_file: { type: "create_file", filename: "path/to/file" }
-2. write_line: { type: "write_line", content: "line text", row: optional_line_number }
-3. append_line: { type: "append_line", content: "line text" }
-4. write_buffer: { type: "write_buffer", content: "full file content" }
-5. save_buffer: { type: "save_buffer", filename: optional_new_filename }
+2. write_buffer: { 
+    type: "write_buffer", 
+    content: "# Title\n\nContent here\nMore content" 
+   }
+3. append_line: { 
+    type: "append_line", 
+    content: ["Line 1", "Line 2", "Line 3"]
+   }
+4. save_buffer: { type: "save_buffer" }
 
+Note: When writing multiline content, you can either:
+- Use "\n" in a single string
+- Provide an array of lines
 IMPORTANT:
 - Think step by step
 - Request user confirmation for dangerous operations
