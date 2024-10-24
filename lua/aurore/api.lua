@@ -25,7 +25,19 @@ Always respond with JSON in this structure:
     "plan": ["Step 1", "Step 2", ...],
     "current_step": {
         "commands": [], // shell commands to execute
-        "vim_commands": [], // neovim commands to execute
+        "vim_commands": [  // Neovim commands as structured objects
+            {
+                "type": "create_file",
+                "filename": "example.py"
+            },
+            {
+                "type": "write_buffer",
+                "content": "print('hello world')"
+            },
+            {
+                "type": "save_buffer"
+            }
+        ],
         "file_operations": [], // file operations to perform
         "message": "" // explanation for the user
     },
@@ -33,56 +45,100 @@ Always respond with JSON in this structure:
     "task_complete": false // true when the entire task is done
 }
 
+AVAILABLE VIM COMMANDS:
+1. create_file: { type: "create_file", filename: "path/to/file" }
+2. write_line: { type: "write_line", content: "line text", row: optional_line_number }
+3. append_line: { type: "append_line", content: "line text" }
+4. write_buffer: { type: "write_buffer", content: "full file content" }
+5. save_buffer: { type: "save_buffer", filename: optional_new_filename }
+
 IMPORTANT:
 - Think step by step
 - Request user confirmation for dangerous operations
 - Keep the user informed of your plan
 - Continue executing steps until the task is complete
-- You can read file contents and command outputs to inform your next steps]]
+- Use structured commands for better reliability
+- Provide detailed explanations in your "thought" field]]
+
+-- Helper function to show fancy separator
+local function show_separator()
+    vim.api.nvim_echo({{"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", "Comment"}}, false, {})
+end
+
+-- Helper function to show status messages
+local function show_status(icon, message, message_type)
+    vim.api.nvim_echo({
+        {icon .. " ", "None"},
+        {message .. "\n", message_type or "None"}
+    }, false, {})
+end
+
 
 -- OpenAI API call
 local function call_openai(prompt, context)
-    local response = curl.post(ENDPOINTS.openai, {
-        headers = {
-            Authorization = "Bearer " .. config.openai_api_key,
-            ["Content-Type"] = "application/json",
+    show_status("🌐", "Sending request to OpenAI...")
+    
+    -- Debug output
+    vim.api.nvim_echo({{"Checking OpenAI API key... ", "None"}}, false, {})
+    if not config.openai_api_key then
+        show_status("❌", "OpenAI API key not found! Please set OPENAI_API_KEY environment variable", "ErrorMsg")
+        return nil
+    end
+
+    local body = vim.json.encode({
+        model = config.openai_model or "gpt-4",
+        messages = {
+            { role = "system", content = AGENT_PROMPT },
+            { role = "user", content = vim.json.encode({
+                command = prompt,
+                context = context
+            })}
         },
-        body = vim.json.encode({
-            model = config.openai_model or "gpt-4",
-            messages = {
-                { role = "system", content = AGENT_PROMPT },
-                { role = "user", content = vim.json.encode({
-                    command = prompt,
-                    context = context
-                })}
-            },
-            temperature = 0.7,
-            -- Remove the response_format parameter since it's not supported
-        })
+        temperature = 0.7
+    })
+
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Authorization"] = "Bearer " .. config.openai_api_key
+    }
+
+    -- Debug the request
+    vim.api.nvim_echo({{"Making API request...\n", "None"}}, false, {})
+    
+    local response = curl.post(ENDPOINTS.openai, {
+        headers = headers,
+        body = body,
+        timeout = 30000, -- Increase timeout to 30 seconds
     })
     
-    if response.status ~= 200 then
-        vim.notify("OpenAI API error: " .. (response.body or "Unknown error"), vim.log.levels.ERROR)
+    if not response or response.status ~= 200 then
+        local error_msg = response and response.body or "No response"
+        show_status("❌", "OpenAI API error: " .. error_msg, "ErrorMsg")
         return nil
     end
     
-    local result = vim.json.decode(response.body)
-    -- Since we're not forcing JSON format, we need to parse the content as JSON
+    local ok, result = pcall(vim.json.decode, response.body)
+    if not ok then
+        show_status("❌", "Failed to parse OpenAI response", "ErrorMsg")
+        return nil
+    end
+
+
     local content = result.choices[1].message.content
-    -- The content might already be JSON, so we need to handle both cases
     local success, parsed = pcall(vim.json.decode, content)
     if success then
         return parsed
     else
-        vim.notify("Failed to parse AI response as JSON", vim.log.levels.ERROR)
+        vim.api.nvim_echo({{"Failed to parse AI response content: ", "ErrorMsg"}, {content, "None"}}, false, {})
         return nil
     end
 end
 
 
-
 -- Anthropic API call
 local function call_anthropic(prompt, context)
+    show_status("🌐", "Sending request to Anthropic...")
+    
     local response = curl.post(ENDPOINTS.anthropic, {
         headers = {
             ["X-Api-Key"] = config.anthropic_api_key,
@@ -109,7 +165,7 @@ Respond only with JSON in the specified format.]],
     })
     
     if response.status ~= 200 then
-        vim.notify("Anthropic API error: " .. (response.body or "Unknown error"), vim.log.levels.ERROR)
+        show_status("❌", "Anthropic API error: " .. (response.body or "Unknown error"), "ErrorMsg")
         return nil
     end
     
@@ -124,7 +180,7 @@ local function send_ai_request(prompt, context)
     elseif config.ai_provider == "anthropic" then
         return call_anthropic(prompt, context)
     else
-        vim.notify("Unknown AI provider: " .. tostring(config.ai_provider), vim.log.levels.ERROR)
+        show_status("❌", "Unknown AI provider: " .. tostring(config.ai_provider), "ErrorMsg")
         return nil
     end
 end
@@ -139,7 +195,7 @@ local function check_operation_success(results)
     
     for _, vim_result in ipairs(results.vim_outputs or {}) do
         if not vim_result.success then
-            return false, "Vim command failed: " .. vim_result.command
+            return false, "Vim command failed: " .. vim.inspect(vim_result.command)
         end
     end
     
@@ -162,17 +218,34 @@ local function execute_step(step)
     
     -- Execute shell commands
     for _, cmd in ipairs(step.commands or {}) do
+        show_status("🔧", "Running command: " .. cmd)
         local success, output = tools.bash.execute(cmd)
         table.insert(results.command_outputs, {
             command = cmd,
             success = success,
             output = output
         })
+        if success then
+            show_status("✓", "Command completed: " .. output)
+        else
+            show_status("✗", "Command failed: " .. output, "ErrorMsg")
+        end
     end
     
     -- Execute vim commands
     for _, cmd in ipairs(step.vim_commands or {}) do
+        if type(cmd) == "table" then
+            show_status("🔧", "Vim operation: " .. cmd.type .. (cmd.filename and (" on " .. cmd.filename) or ""))
+        else
+            show_status("🔧", "Vim command: " .. tostring(cmd))
+        end
+        
         local success, output = tools.editor.execute(cmd)
+        if success then
+            show_status("✓", "Operation completed")
+        else
+            show_status("✗", "Operation failed: " .. tostring(output), "ErrorMsg")
+        end
         table.insert(results.vim_outputs, {
             command = cmd,
             success = success,
@@ -182,7 +255,13 @@ local function execute_step(step)
     
     -- Handle file operations
     for _, op in ipairs(step.file_operations or {}) do
+        show_status("🔧", "File operation: " .. vim.inspect(op))
         local success, output = tools.computer.handle_file_operation(op)
+        if success then
+            show_status("✓", "File operation completed")
+        else
+            show_status("✗", "File operation failed: " .. output, "ErrorMsg")
+        end
         table.insert(results.file_operations, {
             operation = op,
             success = success,
@@ -214,20 +293,27 @@ local function run_agent(initial_prompt)
         initial_prompt = initial_prompt
     }
     
+    show_separator()
+    show_status("🤖", "Starting task: " .. initial_prompt, "Title")
+    
     -- Initial plan
     local response = send_ai_request(initial_prompt, context)
     if not response then return end
     
-    -- Show initial plan to user
-    vim.api.nvim_echo({{"AI Plan:\n", "Title"}}, false, {})
+    -- Show initial plan
+    show_separator()
+    show_status("📋", "Planned steps:", "Title")
     for i, step in ipairs(response.plan) do
-        vim.api.nvim_echo({{i .. ". " .. step .. "\n", "Normal"}}, false, {})
+        show_status("", i .. ". " .. step)
     end
     
     -- Execute steps until task is complete
+    local current_step = 0
     while not response.task_complete do
-        -- Show current thought process
-        vim.api.nvim_echo({{"Thinking: " .. response.thought .. "\n", "Comment"}}, false, {})
+        current_step = current_step + 1
+        show_separator()
+        show_status("🔄", "Step " .. current_step .. "/" .. #response.plan .. ":", "Title")
+        show_status("💭", response.thought, "Comment")
         
         -- Execute current step
         local step_results = execute_step(response.current_step)
@@ -235,24 +321,25 @@ local function run_agent(initial_prompt)
         -- Check if successful
         local success, error = check_operation_success(step_results)
         if not success then
-            vim.notify("Error executing step: " .. error, vim.log.levels.ERROR)
+            show_status("❌", "Error: " .. error, "ErrorMsg")
             return
         end
         
         -- Show message to user
         if response.current_step.message then
-            vim.api.nvim_echo({{"AI: " .. response.current_step.message .. "\n", "Normal"}}, false, {})
+            show_status("💬", response.current_step.message)
         end
         
         -- Get next step
         response = continue_execution(step_results, context, initial_prompt)
         if not response then return end
         
-        -- Optional: sleep briefly to not overwhelm the system
+        -- Sleep briefly to make output readable
         vim.cmd('sleep 100m')
     end
     
-    vim.api.nvim_echo({{"Task completed!\n", "Title"}}, false, {})
+    show_separator()
+    show_status("✨", "Task completed!", "Title")
 end
 
 -- Initialize the API
