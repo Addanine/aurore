@@ -1,11 +1,14 @@
 -- plugin/aurore.lua
 if vim.g.loaded_aurore then
-  return
+    return
 end
 vim.g.loaded_aurore = true
 
 -- Create user command
 vim.api.nvim_create_user_command('Aurore', function(opts)
+    -- Change this line:
+    -- From: require('aurore.api').execute_task(table.concat(opts.fargs, ' '))
+    -- To:
     require('aurore.api').execute_task(table.concat(opts.fargs, ' '))
 end, {
     nargs = '+',

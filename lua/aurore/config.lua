@@ -1,12 +1,15 @@
 local M = {}
 
 local defaults = {
-    ai_provider = "openai", -- or "anthropic"
-    api_key = nil, -- will prompt user if not set
+    ai_provider = "openai",
+    openai_api_key = nil,
+    openai_model = "gpt-4o",
+    anthropic_api_key = nil,
+    anthropic_model = "claude-3-opus-20240229",
     ui = {
         border = "rounded",
-        width = 0.8,    -- percentage of screen width
-        height = 0.8,   -- percentage of screen height
+        width = 0.8,
+        height = 0.8,
     },
     keymaps = {
         toggle = "<leader>ai",

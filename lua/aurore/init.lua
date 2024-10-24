@@ -7,8 +7,8 @@ M.setup = function(opts)
     -- Merge user options with defaults
     config.setup(opts)
     
-    -- Initialize API
-    require('aurore.api').setup()
+    -- Initialize API with config
+    require('aurore.api').setup(config.options)
     
     -- Initialize UI
     require('aurore.ui').setup()
