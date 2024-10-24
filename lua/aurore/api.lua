@@ -1,15 +1,29 @@
-local M = {}
+-- api.lua
 local curl = require('plenary.curl')
+local config = require('aurore.config')
+local ui = require('aurore.ui.status')
+local recovery = require('aurore.recovery')
+local debug = require('aurore.debug')
+local docs = require('aurore.docs')
 
--- Store config reference
-local config = nil
-local tools = nil
+-- State management
+local task_history = {}
+local current_task = nil
+
+-- Retry configuration
+local RETRY_CONFIG = {
+    max_attempts = 3,
+    initial_delay = 1000, -- 1 second
+    max_delay = 5000 -- 5 seconds
+}
 
 -- API endpoints
 local ENDPOINTS = {
     openai = "https://api.openai.com/v1/chat/completions",
     anthropic = "https://api.anthropic.com/v1/messages",
 }
+
+-- Agent system prompt
 local AGENT_PROMPT = [[You are an autonomous AI agent with direct access to a computer through Neovim. You can:
 1. Execute terminal commands
 2. Modify files
@@ -35,6 +49,7 @@ When working with LSP:
 - Apply suggested fixes when available
 - Verify changes after applying fixes
 
+RESPONSE FORMAT:
 Always respond with JSON in this structure:
 {
     "thought": "Your current thinking process",
@@ -49,9 +64,6 @@ Always respond with JSON in this structure:
             {
                 "type": "write_buffer",
                 "content": "print('hello world')"
-            },
-            {
-                "type": "save_buffer"
             }
         ],
         "file_operations": [], // file operations to perform
@@ -61,179 +73,198 @@ Always respond with JSON in this structure:
     "task_complete": false // true when the entire task is done
 }
 
-AVAILABLE VIM COMMANDS:
-1. create_file: { type: "create_file", filename: "path/to/file" }
-2. write_buffer: { 
-    type: "write_buffer", 
-    content: "# Title\n\nContent here\nMore content" 
-   }
-3. append_line: { 
-    type: "append_line", 
-    content: ["Line 1", "Line 2", "Line 3"]
-   }
-4. save_buffer: { type: "save_buffer" }
+IMPORTANT GUIDELINES:
+1. Do not repeat operations on the same file
+2. Mark task_complete as true when:
+   - All files are created and written
+   - All tests have passed
+   - No more modifications are needed
+3. Avoid repeating the same operations
+4. Track your progress and don't recreate existing files
+5. When a file is complete, move on to the next task
+6. Consider a task complete when all specified requirements are met]]
 
-Note: When writing multiline content, you can either:
-- Use "\n" in a single string
-- Provide an array of lines
-IMPORTANT:
-- Think step by step
-- Request user confirmation for dangerous operations
-- Keep the user informed of your plan
-- Continue executing steps until the task is complete
-- Use structured commands for better reliability
-- Provide detailed explanations in your "thought" field]]
+-- Task state management
+local task_state = {
+    files_created = {},
+    operations_performed = {},
+    current_iteration = 0,
+    max_iterations = 5
+}
 
--- Helper function to show fancy separator
-local function show_separator()
-    vim.api.nvim_echo({{"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", "Comment"}}, false, {})
-end
+-- Helper function for retry logic
+local function retry_with_backoff(fn)
+    local attempt = 1
+    local delay = RETRY_CONFIG.initial_delay
 
--- Helper function to show status messages
-local function show_status(icon, message, message_type)
-    vim.api.nvim_echo({
-        {icon .. " ", "None"},
-        {message .. "\n", message_type or "None"}
-    }, false, {})
-end
+    while attempt <= RETRY_CONFIG.max_attempts do
+        debug.log('retry', string.format('Attempt %d/%d', attempt, RETRY_CONFIG.max_attempts))
+        
+        local success, result = pcall(fn)
+        if success then
+            return result
+        end
 
+        ui.update({
+            status = string.format("Attempt %d failed, retrying in %dms...", attempt, delay)
+        })
 
--- OpenAI API call
-local function call_openai(prompt, context)
-    show_status("🌐", "Sending request to OpenAI...")
+        vim.cmd(string.format('sleep %dm', delay / 1000))
+        
+        attempt = attempt + 1
+        delay = math.min(delay * 2, RETRY_CONFIG.max_delay)
+    end
     
-    -- Debug output
-    vim.api.nvim_echo({{"Checking OpenAI API key... ", "None"}}, false, {})
-    if not config.openai_api_key then
-        show_status("❌", "OpenAI API key not found! Please set OPENAI_API_KEY environment variable", "ErrorMsg")
-        return nil
+    return nil, "Max retry attempts reached"
+end
+
+-- API call implementations
+local function call_openai(prompt, context)
+    debug.log('api_call', 'Sending request to OpenAI')
+    ui.update({ status = "Sending request to OpenAI..." })
+    
+    local function make_request()
+        return curl.post(ENDPOINTS.openai, {
+            headers = {
+                Authorization = "Bearer " .. config.options.openai_api_key,
+                ["Content-Type"] = "application/json",
+            },
+            body = vim.json.encode({
+                model = config.options.openai_model or "gpt-4",
+                messages = {
+                    { role = "system", content = AGENT_PROMPT },
+                    { role = "user", content = vim.json.encode({
+                        command = prompt,
+                        context = context
+                    })}
+                },
+                temperature = 0.7
+            }),
+            timeout = config.options.task.timeout or 30000
+        })
     end
 
-    local body = vim.json.encode({
-        model = config.openai_model or "gpt-4",
-        messages = {
-            { role = "system", content = AGENT_PROMPT },
-            { role = "user", content = vim.json.encode({
-                command = prompt,
-                context = context
-            })}
-        },
-        temperature = 0.7
-    })
-
-    local headers = {
-        ["Content-Type"] = "application/json",
-        ["Authorization"] = "Bearer " .. config.openai_api_key
-    }
-
-    -- Debug the request
-    vim.api.nvim_echo({{"Making API request...\n", "None"}}, false, {})
-    
-    local response = curl.post(ENDPOINTS.openai, {
-        headers = headers,
-        body = body,
-        timeout = 30000, -- Increase timeout to 30 seconds
-    })
+    local response = retry_with_backoff(make_request)
     
     if not response or response.status ~= 200 then
-        local error_msg = response and response.body or "No response"
-        show_status("❌", "OpenAI API error: " .. error_msg, "ErrorMsg")
+        debug.log('api_error', 'OpenAI API error: ' .. (response and response.body or "No response"))
+        ui.update({ status = "API Error", error = response and response.body or "Request failed" })
         return nil
     end
     
     local ok, result = pcall(vim.json.decode, response.body)
     if not ok then
-        show_status("❌", "Failed to parse OpenAI response", "ErrorMsg")
+        debug.log('api_error', 'Failed to parse OpenAI response')
         return nil
     end
-
 
     local content = result.choices[1].message.content
     local success, parsed = pcall(vim.json.decode, content)
     if success then
         return parsed
     else
-        vim.api.nvim_echo({{"Failed to parse AI response content: ", "ErrorMsg"}, {content, "None"}}, false, {})
+        debug.log('api_error', 'Failed to parse AI response as JSON')
         return nil
     end
 end
 
-
--- Anthropic API call
 local function call_anthropic(prompt, context)
-    show_status("🌐", "Sending request to Anthropic...")
+    debug.log('api_call', 'Sending request to Anthropic')
+    ui.update({ status = "Sending request to Anthropic..." })
     
-    local response = curl.post(ENDPOINTS.anthropic, {
-        headers = {
-            ["X-Api-Key"] = config.anthropic_api_key,
-            ["Content-Type"] = "application/json",
-            ["anthropic-version"] = "2023-06-01"
-        },
-        body = vim.json.encode({
-            model = config.anthropic_model or "claude-3-opus-20240229",
-            max_tokens = 1024,
-            messages = {
-                {
-                    role = "user",
-                    content = string.format([[%s
+    local function make_request()
+        return curl.post(ENDPOINTS.anthropic, {
+            headers = {
+                ["X-Api-Key"] = config.options.anthropic_api_key,
+                ["Content-Type"] = "application/json",
+                ["anthropic-version"] = "2023-06-01"
+            },
+            body = vim.json.encode({
+                model = config.options.anthropic_model or "claude-3-5-sonnet-20241022",
+                max_tokens = 4096,
+                messages = {
+                    {
+                        role = "user",
+                        content = string.format([[%s
 Context: %s
 Command: %s
 Respond only with JSON in the specified format.]], 
-                        AGENT_PROMPT,
-                        vim.json.encode(context),
-                        prompt
-                    )
+                            AGENT_PROMPT,
+                            vim.json.encode(context),
+                            prompt
+                        )
+                    }
                 }
-            }
+            }),
+            timeout = config.options.task.timeout or 30000
         })
-    })
+    end
+
+    local response = retry_with_backoff(make_request)
     
-    if response.status ~= 200 then
-        show_status("❌", "Anthropic API error: " .. (response.body or "Unknown error"), "ErrorMsg")
+    if not response or response.status ~= 200 then
+        debug.log('api_error', 'Anthropic API error: ' .. (response and response.body or "No response"))
+        ui.update({ status = "API Error", error = response and response.body or "Request failed" })
         return nil
     end
     
-    local result = vim.json.decode(response.body)
-    return vim.json.decode(result.content[1].text)
+    local ok, result = pcall(vim.json.decode, response.body)
+    if not ok then
+        debug.log('api_error', 'Failed to parse Anthropic response')
+        return nil
+    end
+
+    if not result.content or not result.content[1] or not result.content[1].text then
+        debug.log('api_error', 'Unexpected Anthropic response format')
+        return nil
+    end
+
+    local ok2, parsed = pcall(vim.json.decode, result.content[1].text)
+    if ok2 then
+        return parsed
+    else
+        debug.log('api_error', 'Failed to parse AI response as JSON')
+        return nil
+    end
 end
 
--- Send request to AI provider
+-- Main API request function
 local function send_ai_request(prompt, context)
-    if config.ai_provider == "openai" then
+    debug.log('request', string.format('Sending request - Provider: %s', config.options.ai_provider))
+    
+    if config.options.ai_provider == "openai" then
         return call_openai(prompt, context)
-    elseif config.ai_provider == "anthropic" then
+    elseif config.options.ai_provider == "anthropic" then
         return call_anthropic(prompt, context)
     else
-        show_status("❌", "Unknown AI provider: " .. tostring(config.ai_provider), "ErrorMsg")
+        debug.log('error', 'Unknown AI provider: ' .. tostring(config.options.ai_provider))
+        ui.update({ status = "Error", error = "Unknown AI provider" })
         return nil
     end
 end
 
--- Function to check if operations were successful
-local function check_operation_success(results)
-    for _, cmd_result in ipairs(results.command_outputs or {}) do
-        if not cmd_result.success then
-            return false, "Command failed: " .. cmd_result.command
-        end
-    end
-    
-    for _, vim_result in ipairs(results.vim_outputs or {}) do
-        if not vim_result.success then
-            return false, "Vim command failed: " .. vim.inspect(vim_result.command)
-        end
-    end
-    
-    for _, file_result in ipairs(results.file_operations or {}) do
-        if not file_result.success then
-            return false, "File operation failed: " .. vim.inspect(file_result.operation)
-        end
-    end
-    
-    return true, ""
+-- Operation tracking
+local function is_repetitive_operation(operation)
+    local op_key = vim.inspect(operation)
+    task_state.operations_performed[op_key] = (task_state.operations_performed[op_key] or 0) + 1
+    return task_state.operations_performed[op_key] > 2
 end
 
--- Execute a single step of the agent's plan
+local function track_file_operation(filename)
+    if task_state.files_created[filename] then
+        return false
+    end
+    task_state.files_created[filename] = true
+    return true
+end
+
+-- Execute a single step
 local function execute_step(step)
+    debug.log('step', 'Executing step: ' .. vim.inspect(step))
+    
+    -- Create checkpoint before executing step
+    local checkpoint = recovery.save_checkpoint()
+    
     local results = {
         command_outputs = {},
         vim_outputs = {},
@@ -242,50 +273,64 @@ local function execute_step(step)
     
     -- Execute shell commands
     for _, cmd in ipairs(step.commands or {}) do
-        show_status("🔧", "Running command: " .. cmd)
+        debug.log('command', 'Executing command: ' .. cmd)
+        ui.update({ current_operation = "Running: " .. cmd })
+        
+        -- Check for dangerous commands
+        if cmd:match('^%s*rm%s') or cmd:match('^%s*sudo%s') then
+            if not vim.fn.confirm('Execute potentially dangerous command: ' .. cmd, '&Yes\n&No', 2) == 1 then
+                debug.log('command', 'User rejected dangerous command: ' .. cmd)
+                goto continue
+            end
+        end
+        
         local success, output = tools.bash.execute(cmd)
         table.insert(results.command_outputs, {
             command = cmd,
             success = success,
             output = output
         })
-        if success then
-            show_status("✓", "Command completed: " .. output)
-        else
-            show_status("✗", "Command failed: " .. output, "ErrorMsg")
-        end
+        
+        debug.log('command_result', string.format('Success: %s, Output: %s', success, output))
+        
+        ::continue::
     end
     
     -- Execute vim commands
     for _, cmd in ipairs(step.vim_commands or {}) do
         if type(cmd) == "table" then
-            show_status("🔧", "Vim operation: " .. cmd.type .. (cmd.filename and (" on " .. cmd.filename) or ""))
-        else
-            show_status("🔧", "Vim command: " .. tostring(cmd))
+            if cmd.type == "create_file" then
+                if not track_file_operation(cmd.filename) then
+                    debug.log('skip', 'File already exists: ' .. cmd.filename)
+                    goto continue
+                end
+            end
+            
+            if is_repetitive_operation(cmd) then
+                debug.log('skip', 'Skipping repetitive operation: ' .. vim.inspect(cmd))
+                goto continue
+            end
         end
         
+        debug.log('vim', 'Executing vim command: ' .. vim.inspect(cmd))
+        ui.update({ current_operation = "Vim: " .. (type(cmd) == "table" and cmd.type or cmd) })
+        
         local success, output = tools.editor.execute(cmd)
-        if success then
-            show_status("✓", "Operation completed")
-        else
-            show_status("✗", "Operation failed: " .. tostring(output), "ErrorMsg")
-        end
         table.insert(results.vim_outputs, {
             command = cmd,
             success = success,
             output = output
         })
+        
+        ::continue::
     end
     
     -- Handle file operations
     for _, op in ipairs(step.file_operations or {}) do
-        show_status("🔧", "File operation: " .. vim.inspect(op))
+        debug.log('file', 'Executing file operation: ' .. vim.inspect(op))
+        ui.update({ current_operation = "File operation: " .. op.type })
+        
         local success, output = tools.computer.handle_file_operation(op)
-        if success then
-            show_status("✓", "File operation completed")
-        else
-            show_status("✗", "File operation failed: " .. output, "ErrorMsg")
-        end
         table.insert(results.file_operations, {
             operation = op,
             success = success,
@@ -296,20 +341,38 @@ local function execute_step(step)
     return results
 end
 
--- Function to continue agent execution
+-- Continue execution with context
 local function continue_execution(previous_results, task_context, initial_prompt)
-    local context = vim.tbl_extend("force", task_context or {}, {
+    local context = vim.tbl_deep_extend("force", task_context or {}, {
         previous_results = previous_results,
         initial_prompt = initial_prompt,
         cwd = vim.fn.getcwd(),
         current_file = vim.fn.expand('%:p'),
     })
     
+    debug.log('continue', 'Continuing execution with context')
     return send_ai_request("Continue with the next step based on previous results.", context)
 end
 
--- Main agent loop
+-- Main execution loop
 local function run_agent(initial_prompt)
+    debug.log('task_start', 'Starting new task: ' .. initial_prompt)
+    
+    -- Reset task state
+    task_state = {
+        files_created = {},
+        operations_performed = {},
+        current_iteration = 0,
+        max_iterations = config.options.task.max_iterations or 5
+    }
+    
+    -- Initialize current task
+    current_task = {
+        prompt = initial_prompt,
+        steps = {},
+        start_time = os.time()
+    }
+    
     local context = {
         cwd = vim.fn.getcwd(),
         current_file = vim.fn.expand('%:p'),
@@ -317,64 +380,134 @@ local function run_agent(initial_prompt)
         initial_prompt = initial_prompt
     }
     
-    show_separator()
-    show_status("🤖", "Starting task: " .. initial_prompt, "Title")
+    -- Create initial checkpoint
+    local checkpoint = recovery.save_checkpoint()
     
-    -- Initial plan
+    -- Get initial plan
     local response = send_ai_request(initial_prompt, context)
     if not response then return end
     
     -- Show initial plan
-    show_separator()
-    show_status("📋", "Planned steps:", "Title")
-    for i, step in ipairs(response.plan) do
-        show_status("", i .. ". " .. step)
-    end
+    ui.update({
+        task = {
+            description = initial_prompt,
+            plan = response.plan,
+            current_step = 0,
+            total_steps = #response.plan
+        }
+    })
     
     -- Execute steps until task is complete
-    local current_step = 0
-    while not response.task_complete do
-        current_step = current_step + 1
-        show_separator()
-        show_status("🔄", "Step " .. current_step .. "/" .. #response.plan .. ":", "Title")
-        show_status("💭", response.thought, "Comment")
+    while not response.task_complete and task_state.current_iteration < task_state.max_iterations do
+        task_state.current_iteration = task_state.current_iteration + 1
+        
+        debug.log('step', string.format('Executing step %d/%d', task_state.current_iteration, #response.plan))
+        ui.update({
+            task = {
+                current_step = task_state.current_iteration,
+                total_steps = #response.plan,
+                thought = response.thought
+            }
+        })
         
         -- Execute current step
         local step_results = execute_step(response.current_step)
         
-        -- Check if successful
-        local success, error = check_operation_success(step_results)
-        if not success then
-            show_status("❌", "Error: " .. error, "ErrorMsg")
-            return
-        end
+        -- Save step in task history
+        table.insert(current_task.steps, {
+            thought = response.thought,
+            action = response.current_step,
+            results = step_results
+        })
         
-        -- Show message to user
-        if response.current_step.message then
-            show_status("💬", response.current_step.message)
+        -- Check for errors
+        local success, error = pcall(function()
+            -- Handle results
+            if vim.tbl_count(step_results.command_outputs) == 0 and
+               vim.tbl_count(step_results.vim_outputs) == 0 and
+               vim.tbl_count(step_results.file_operations) == 0 then
+                debug.log('warning', 'Step produced no outputs')
+            end
+        end)
+        
+        if not success then
+            debug.log('error', 'Error in step execution: ' .. error)
+            if config.options.features.auto_recovery then
+                debug.log('recovery', 'Attempting to restore checkpoint')
+                recovery.restore_checkpoint(checkpoint)
+            end
+            break
         end
         
         -- Get next step
         response = continue_execution(step_results, context, initial_prompt)
-        if not response then return end
+        if not response then break end
         
-        -- Sleep briefly to make output readable
+        -- Create new checkpoint
+        checkpoint = recovery.save_checkpoint()
+        
+        -- Optional delay to prevent overwhelming the system
         vim.cmd('sleep 100m')
     end
     
-    show_separator()
-    show_status("✨", "Task completed!", "Title")
+    -- Task completion
+    if response and response.task_complete then
+        debug.log('task_complete', 'Task completed successfully')
+        
+        -- Generate documentation
+        if config.options.features.auto_documentation then
+            local documentation = docs.generate_task_doc(current_task)
+            vim.fn.writefile(vim.split(documentation, '\n'), 'AURORE_TASKS.md', 'a')
+        end
+        
+        -- Update task history
+        current_task.end_time = os.time()
+        current_task.success = true
+        table.insert(task_history, current_task)
+        
+        ui.update({ status = "Task completed!" })
+    else
+        debug.log('task_incomplete', 'Task did not complete successfully')
+        current_task.end_time = os.time()
+        current_task.success = false
+        table.insert(task_history, current_task)
+    end
 end
 
--- Initialize the API
+-- Module exports
+local M = {}
+
 M.setup = function(opts)
     config = opts
-    tools = require('aurore.tools')
+    debug.log('setup', 'API module initialized with config: ' .. vim.inspect(opts))
 end
 
--- Main entry point for user commands
 M.execute_task = function(prompt)
     run_agent(prompt)
+end
+
+M.show_history = function()
+    local lines = {}
+    for i, task in ipairs(task_history) do
+        table.insert(lines, string.format("%d. %s", i, task.prompt))
+        table.insert(lines, string.format("   Duration: %ds", task.end_time - task.start_time))
+        table.insert(lines, string.format("   Success: %s", task.success))
+        table.insert(lines, string.format("   Steps: %d", #task.steps))
+        table.insert(lines, "")
+    end
+    
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    
+    vim.api.nvim_open_win(buf, true, {
+        relative = 'editor',
+        width = math.min(120, vim.o.columns - 4),
+        height = math.min(#lines, vim.o.lines - 4),
+        row = 1,
+        col = 1,
+        style = 'minimal',
+        border = 'rounded'
+    })
 end
 
 return M
