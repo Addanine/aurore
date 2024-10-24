@@ -39,23 +39,3 @@ require('aurore').setup({
 ```
 
 2. Restart Neovim for changes to take effect
-
-## Usage
-
-Describe the main features and how to use them here.
-
-## Configuration
-
-List available configuration options and their default values.
-
-## Commands
-
-Document available commands and their usage.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## License
-
-MIT License - see [LICENSE](LICENSE) for details
